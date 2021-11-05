@@ -8,7 +8,7 @@ use std::sync::{
     Arc,
 };
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, bail};
 use cargo_metadata::Artifact;
 use probe_rs_cli_util::{
     common_options::{CargoOptions, FlashOptions},
@@ -17,6 +17,11 @@ use probe_rs_cli_util::{
 use rtic_scope_api as api;
 use structopt::StructOpt;
 use thiserror::Error;
+use futures::{future, select, executor::block_on, pin_mut, FutureExt};
+use std::pin::Pin;
+use futures::Stream;
+use crate::sources::SourceError;
+
 
 mod build;
 mod diag;
@@ -340,7 +345,7 @@ fn main_try() -> Result<(), RTICScopeError> {
 
     // All preparatory I/O and information recovery done. Forward all
     // trace packets to all sinks.
-    let retstatus = run_loop(source, sinks, metadata, &opts, artifact.target.name);
+    let retstatus = block_on(run_loop(source, sinks, metadata, &opts, artifact.target.name));
 
     // Wait for frontends to proccess all packets and echo its' stderr
     for (i, (child, stderr)) in children.iter_mut().enumerate() {
@@ -364,7 +369,7 @@ fn main_try() -> Result<(), RTICScopeError> {
     retstatus
 }
 
-fn run_loop(
+async fn run_loop(
     mut source: Box<dyn sources::Source>,
     mut sinks: Vec<Box<dyn sinks::Sink>>,
     metadata: recovery::Metadata,
@@ -385,7 +390,6 @@ fn run_loop(
         sinks.drain(..).map(|s| (s, false)).collect();
     let sinks_at_start = sinks.len();
 
-    let mut retstatus = Ok(());
     let mut buffer_warning = false;
 
     #[derive(Default)]
@@ -401,31 +405,7 @@ fn run_loop(
 
     let instant = std::time::Instant::now();
 
-    while let Some(data) = source.next() {
-        if halt.load(Ordering::SeqCst) {
-            break;
-        }
-
-        // Eventually warn about the source input buffer overflowing,
-        // but only once.
-        if !buffer_warning {
-            if let sources::BufferStatus::AvailWarn(avail, buf_sz) = source.avail_buffer() {
-                eprintln!(
-                    "Source buffer is almost full ({}/{} bytes free) and it not read quickly enough",
-                    avail, buf_sz
-                );
-                buffer_warning = true;
-            }
-        }
-
-        // Try to read data from the source. Failure is fatal.
-        let data = data.with_context(|| {
-            format!(
-                "Failed to read trace data from source {}",
-                source.describe()
-            )
-        })?;
-
+    let mut handle_packet = |data: TraceData| -> Result<(), anyhow::Error> {
         // Try to recover RTIC information for the packets.
         let chunk = metadata.build_event_chunk(data.clone());
 
@@ -472,8 +452,7 @@ fn run_loop(
         // TODO replace weth Vec::drain_filter when stable.
         sinks.retain(|(_, is_broken)| !is_broken);
         if sinks.is_empty() {
-            retstatus = Err(anyhow!("All sinks broken. Cannot continue."));
-            break;
+            bail!("All sinks are broken. Cannot continue.");
         }
 
         let duration = instant.elapsed();
@@ -516,12 +495,72 @@ fn run_loop(
                 sinks = format!("{}/{} sinks operational", sinks.len(), sinks_at_start),
             ),
         );
+
+        Ok(())
+    };
+
+    use futures::stream::{self, StreamExt};
+    let mut stream = stream::iter(source);
+    let _ = stream.next();
+    // pin_mut!(stream);
+    use futures::TryStreamExt;
+
+    loop {
+        // async fn poll_next(mut stream: Pin<&mut dyn Stream<Item = Result<TraceData, SourceError>>>) -> Option<Result<TraceData, SourceError>> {
+        //     use futures::stream::StreamExt;
+        //     stream.next().await
+        // }
+
+        // pin_mut!(source);
+
+
+
+        let mut halt_fut = future::ready(halt.load(Ordering::SeqCst));
+        let mut data_fut = async { stream.try_next() }.fuse();
+        // let mut data_fut = async { source.try_next() }.fuse(); // future::ready(source.next());
+        pin_mut!(data_fut);
+
+        select! {
+            h = halt_fut => {
+                if h {
+                    break;
+                }
+            },
+            data = data_fut => {
+                if let Ok(Some(data)) = data.await {
+                    // Eventually warn about the source input buffer overflowing,
+                    // but only once.
+                    // TODO wrap this into another future
+                    // if !buffer_warning {
+                    //     if let sources::BufferStatus::AvailWarn(avail, buf_sz) = source.avail_buffer() {
+                    //         eprintln!(
+                    //             "Source buffer is almost full ({}/{} bytes free) and it not read quickly enough",
+                    //             avail, buf_sz
+                    //         );
+                    //         buffer_warning = true;
+                    //     }
+                    // }
+
+                    // // Try to read data from the source. Failure is fatal.
+                    // let data = data.with_context(|| {
+                    //     format!(
+                    //         "Failed to read trace data from source {}",
+                    //         source.describe()
+                    //     )
+                    // })?;
+
+                    handle_packet(data)?;
+                }
+            },
+            default => continue,
+            complete => continue,
+        }
     }
 
     // close frontend sockets
     drop(sinks);
 
-    retstatus.map_err(|e| e.into())
+    Ok(())
 }
 
 type TraceTuple = (
